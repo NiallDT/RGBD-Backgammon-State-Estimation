@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
+import json
 
 import cv2
 import numpy as np
@@ -19,6 +21,12 @@ class BoardRegistrationConfig:
     canny_low: int = 50
     canny_high: int = 150
     debug: bool = False
+
+    # If automatic registration fails, the fixed-camera prototype can use a
+    # saved corner calibration from roi_preview.py. The JSON format is:
+    # {"corners_xy": [[tl_x, tl_y], [tr_x, tr_y], [br_x, br_y], [bl_x, bl_y]]}
+    use_manual_file_fallback: bool = True
+    manual_corners_path: str = "manual_board_corners.json"
 
 
 def order_corners(corners_xy: np.ndarray) -> np.ndarray:
@@ -114,6 +122,30 @@ class BoardRegistrar:
         self.config = config or BoardRegistrationConfig()
         self._previous_corners: Optional[np.ndarray] = None
         self._manual_corners: Optional[np.ndarray] = None
+        self._manual_file_corners: Optional[np.ndarray] = self._load_manual_corners_file()
+
+    def _load_manual_corners_file(self) -> Optional[np.ndarray]:
+        if not self.config.use_manual_file_fallback:
+            return None
+
+        path = Path(self.config.manual_corners_path)
+        if not path.is_absolute():
+            # Run scripts from the project root where the notebook lives.
+            path = Path.cwd() / path
+
+        if not path.exists():
+            return None
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            corners = np.asarray(payload.get("corners_xy"), dtype=np.float32)
+            if corners.shape != (4, 2):
+                return None
+            return order_corners(corners)
+        except Exception as exc:  # keep registration robust during live runs
+            if self.config.debug:
+                print(f"Could not load manual corners from {path}: {exc}")
+            return None
 
     def set_manual_corners(self, corners_xy: np.ndarray) -> None:
         self._manual_corners = order_corners(corners_xy)

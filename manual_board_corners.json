@@ -1,0 +1,21 @@
+{
+  "corner_order": "top-left, top-right, bottom-right, bottom-left",
+  "corners_xy": [
+    [
+      102.0,
+      40.0
+    ],
+    [
+      530.0,
+      43.0
+    ],
+    [
+      531.0,
+      399.0
+    ],
+    [
+      99.0,
+      398.0
+    ]
+  ]
+}

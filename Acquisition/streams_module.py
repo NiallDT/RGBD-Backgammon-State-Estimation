@@ -195,12 +195,12 @@ class OakSRStreams:
         subpixel_bits: int = 5,
         extended_disparity: bool = False,
         confidence: int = 100,
-        median_mode: int = 1,
+        median_mode: int = 2,
         temporal_filter: bool = True,
-        spatial_filter: bool = False,
+        spatial_filter: bool = True,
         speckle_filter: bool = True,
-        device_depth_min_mm: int = 200,
-        device_depth_max_mm: int = 1000,
+        device_depth_min_mm: int = 360,
+        device_depth_max_mm: int = 450,
     ) -> None:
         if enable_rgb:
             if rgb_socket == "left":

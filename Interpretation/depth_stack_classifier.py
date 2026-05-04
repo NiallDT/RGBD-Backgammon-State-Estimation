@@ -9,6 +9,7 @@ import numpy as np
 
 HeightStat = Literal["median", "p75", "p90", "max", "top35", "top25"]
 RoiFrac = Tuple[float, float, float, float]
+RectFracs = Tuple[RoiFrac, ...]
 
 
 @dataclass
@@ -29,15 +30,10 @@ class ChipCandidate:
     height_top35_mm: float = 0.0
     height_top25_mm: float = 0.0
     height_used_mm: float = 0.0
-    stack_count: int = 0
-    confidence: float = 0.0
     raw_stack_count: int = 0
-    smoothed_stack_count: int = 0
+    stack_count: int = 0
     track_id: int = -1
-    border_distance_px: float = 9999.0
-    near_edge: bool = False
-    near_corner: bool = False
-    held_from_track: bool = False
+    confidence: float = 0.0
 
 
 @dataclass
@@ -134,53 +130,35 @@ def height_to_gray(height_mm: np.ndarray, height_max_mm: float = 30.0) -> np.nda
     return (h * 255.0 / max(height_max_mm, 1.0)).astype(np.uint8)
 
 
-def _roi_mask(shape_hw: Tuple[int, int], roi_frac: Optional[RoiFrac]) -> np.ndarray:
+def _rect_mask(shape_hw: Tuple[int, int], frac: Optional[Tuple[float, float, float, float]]) -> np.ndarray:
     h, w = shape_hw
-    mask = np.ones((h, w), dtype=np.uint8) * 255
-    if roi_frac is None:
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if frac is None:
         return mask
-    x1f, y1f, x2f, y2f = roi_frac
+    x1f, y1f, x2f, y2f = frac
     x1 = int(np.clip(x1f, 0.0, 1.0) * w)
     y1 = int(np.clip(y1f, 0.0, 1.0) * h)
     x2 = int(np.clip(x2f, 0.0, 1.0) * w)
     y2 = int(np.clip(y2f, 0.0, 1.0) * h)
-    mask[:] = 0
     if x2 > x1 and y2 > y1:
         mask[y1:y2, x1:x2] = 255
     return mask
 
 
-
-
-def annotate_candidate_edge_context(
-    cand: ChipCandidate,
-    shape_hw: Tuple[int, int],
-    roi_frac: Optional[RoiFrac],
-    *,
-    edge_margin_px: float = 42.0,
-) -> ChipCandidate:
-    """Mark candidates close to image/ROI edges where depth support is weaker."""
-    h, w = shape_hw
+def _roi_mask(shape_hw: Tuple[int, int], roi_frac: Optional[RoiFrac]) -> np.ndarray:
     if roi_frac is None:
-        x1, y1, x2, y2 = 0.0, 0.0, float(w - 1), float(h - 1)
-    else:
-        x1f, y1f, x2f, y2f = roi_frac
-        x1, y1, x2, y2 = x1f * w, y1f * h, x2f * w, y2f * h
-    # Distance from centre to the usable ROI/image boundary. Radius is included
-    # so a full footprint touching the boundary is treated as edge/corner even
-    # when the centre is slightly inside the board.
-    left = cand.x - x1
-    right = x2 - cand.x
-    top = cand.y - y1
-    bottom = y2 - cand.y
-    border_dist = float(min(left, right, top, bottom))
-    threshold = float(edge_margin_px) + 0.35 * float(cand.radius)
-    near_x = min(left, right) <= threshold
-    near_y = min(top, bottom) <= threshold
-    cand.border_distance_px = border_dist
-    cand.near_edge = bool(near_x or near_y)
-    cand.near_corner = bool(near_x and near_y)
-    return cand
+        return np.ones(shape_hw, dtype=np.uint8) * 255
+    return _rect_mask(shape_hw, roi_frac)
+
+
+def _allowed_mask(shape_hw: Tuple[int, int], roi_frac: Optional[RoiFrac], exclusion_fracs: RectFracs = ()) -> np.ndarray:
+    mask = _roi_mask(shape_hw, roi_frac)
+    for frac in exclusion_fracs:
+        ex = _rect_mask(shape_hw, frac)
+        mask[ex > 0] = 0
+    return mask
+
+
 def clean_mask(mask: np.ndarray, open_px: int = 3, close_px: int = 5, min_area_px: int = 40) -> np.ndarray:
     mask = (mask > 0).astype(np.uint8) * 255
     if open_px > 1:
@@ -234,15 +212,14 @@ class TemporalMaskFilter:
 
 
 
-class TemporalStackSmoother:
+class StackCountSmoother:
     """
-    Track chip candidates over a few frames and apply stack-count hysteresis.
+    Temporally smooths the 1-high vs 2-high stack label for RGB-restored chip candidates.
 
-    The depth support near board edges/corners can intermittently under-read a
-    two-high stack as one-high. This class deliberately keeps detection permissive
-    and smooths only the interpreted stack count. Promotion from 1->2 is fairly
-    quick, while demotion from 2->1 requires more evidence so edge stacks do not
-    flicker.
+    This is intentionally separate from the detection gate. A candidate can be
+    detected with permissive depth support, while the stack label itself changes
+    only after repeated height evidence. That prevents true two-high stacks from
+    flickering between 1 and 2 when passive stereo under-reads a few frames.
     """
 
     def __init__(
@@ -251,197 +228,106 @@ class TemporalStackSmoother:
         window: int = 5,
         promote_votes: int = 2,
         demote_votes: int = 4,
-        max_match_distance_px: float = 24.0,
-        max_misses: int = 6,
         hold_misses: int = 2,
-        edge_margin_px: float = 42.0,
-        edge_promote_height_factor: float = 1.30,
-        edge_demote_height_factor: float = 1.18,
+        promote_height_mm: float = 13.0,
+        demote_height_mm: float = 11.0,
+        match_distance_px: float = 28.0,
     ) -> None:
         self.window = max(1, int(window))
         self.promote_votes = max(1, int(promote_votes))
         self.demote_votes = max(1, int(demote_votes))
-        self.max_match_distance_px = float(max_match_distance_px)
-        self.max_misses = max(1, int(max_misses))
         self.hold_misses = max(0, int(hold_misses))
-        self.edge_margin_px = float(edge_margin_px)
-        self.edge_promote_height_factor = float(edge_promote_height_factor)
-        self.edge_demote_height_factor = float(edge_demote_height_factor)
-        self._tracks: List[Dict[str, object]] = []
+        self.promote_height_mm = float(promote_height_mm)
+        self.demote_height_mm = float(demote_height_mm)
+        self.match_distance_px = float(match_distance_px)
+        self._tracks: Dict[int, Dict[str, object]] = {}
         self._next_id = 1
-
-    @property
-    def track_count(self) -> int:
-        return len(self._tracks)
 
     def reset(self) -> None:
         self._tracks.clear()
         self._next_id = 1
 
-    @staticmethod
-    def _mode_positive(values: List[int], fallback: int = 1) -> int:
-        vals = [int(v) for v in values if int(v) > 0]
-        if not vals:
-            return fallback
-        counts: Dict[int, int] = {}
-        for v in vals:
-            counts[v] = counts.get(v, 0) + 1
-        # Tie-break toward the larger stack because under-reading is the common
-        # failure at edges, while promotion is separately gated by votes.
-        return max(counts.keys(), key=lambda k: (counts[k], k))
+    def _match_track(self, cand: ChipCandidate, used: set[int]) -> int:
+        best_id = -1
+        best_d = float("inf")
+        max_d = max(self.match_distance_px, cand.radius * 1.8)
+        for tid, tr in self._tracks.items():
+            if tid in used:
+                continue
+            dx = float(tr["x"]) - cand.x
+            dy = float(tr["y"]) - cand.y
+            d = float((dx * dx + dy * dy) ** 0.5)
+            if d < best_d and d <= max_d:
+                best_d = d
+                best_id = tid
+        if best_id >= 0:
+            return best_id
+        tid = self._next_id
+        self._next_id += 1
+        self._tracks[tid] = {
+            "x": cand.x,
+            "y": cand.y,
+            "stable": max(1, int(cand.stack_count)),
+            "raw_hist": deque(maxlen=self.window),
+            "height_hist": deque(maxlen=self.window),
+            "misses": 0,
+        }
+        return tid
 
-    def _smooth_count(self, track: Dict[str, object], raw_count: int, height_mm: float) -> int:
-        hist: Deque[int] = track["stack_history"]  # type: ignore[assignment]
-        heights: Deque[float] = track["height_history"]  # type: ignore[assignment]
-        current = int(track.get("stable_stack", raw_count if raw_count > 0 else 1))
-        values = list(hist)
-        height_values = [float(h) for h in heights if float(h) > 0]
-        t = max(float(track.get("chip_thickness_mm", 10.0)), 1.0)
+    def update(self, candidates: List[ChipCandidate]) -> List[ChipCandidate]:
+        used: set[int] = set()
+        active_ids: set[int] = set()
 
-        high_votes = sum(1 for v in values if v >= 2)
-        low_votes = sum(1 for v in values if v <= 1)
-        near_edge = bool(track.get("near_edge", False))
-        near_corner = bool(track.get("near_corner", False))
-
-        recent_heights = height_values[-min(4, len(height_values)):] if height_values else []
-        recent_height = float(np.median(recent_heights)) if recent_heights else float(height_mm)
-        recent_high = float(max(recent_heights)) if recent_heights else float(height_mm)
-
-        # Edge/corner stacks often have sparse depth support, so raw count may
-        # under-read as 1 even when the upper height evidence is still close to
-        # two chip thicknesses. Use height votes as additional promotion evidence
-        # near borders, but keep the normal raw-vote rule elsewhere.
-        edge_promote_floor = self.edge_promote_height_factor * t
-        edge_demote_floor = self.edge_demote_height_factor * t
-        height_high_votes = sum(1 for h in height_values if h >= edge_promote_floor)
-
-        if current <= 1:
-            if high_votes >= self.promote_votes:
-                return max(2, self._mode_positive([v for v in values if v >= 2], fallback=2))
-            if (near_edge or near_corner) and height_high_votes >= max(1, min(self.promote_votes, 2)):
-                return 2
-            return 1 if raw_count > 0 else 0
-
-        # Once a stack is believed to be >=2, avoid demoting because of a single
-        # weak edge/corner frame. Corners are the worst case: use both extra
-        # low-vote evidence and consistently low recent height before demoting.
-        if near_edge or near_corner:
-            required_low = max(self.demote_votes + (2 if near_corner else 1), self.demote_votes)
-            if low_votes >= required_low and recent_high < edge_demote_floor:
-                return 1
-            # If any recent frame still has plausible two-chip height evidence,
-            # keep the existing stack class. This is specifically for bottom-left
-            # / corner flicker where the current frame under-reads.
-            if recent_high >= edge_demote_floor or high_votes > 0:
-                return max(2, current)
-            return current
-
-        two_chip_floor = 1.45 * t
-        if low_votes >= self.demote_votes and recent_height < two_chip_floor:
-            return 1
-
-        high_mode = self._mode_positive([v for v in values if v >= 2], fallback=current)
-        return max(current, high_mode)
-
-    def _should_hold_track(self, track: Dict[str, object]) -> bool:
-        misses = int(track.get("misses", 0))
-        stable = int(track.get("stable_stack", 0))
-        near = bool(track.get("near_edge", False)) or bool(track.get("near_corner", False))
-        return self.hold_misses > 0 and near and stable >= 2 and 0 < misses <= self.hold_misses
-
-    def _candidate_from_track(self, track: Dict[str, object]) -> ChipCandidate:
-        cand = ChipCandidate(
-            x=float(track.get("x", 0.0)),
-            y=float(track.get("y", 0.0)),
-            radius=float(track.get("radius", 16.0)),
-            area_px=float(np.pi * float(track.get("radius", 16.0)) ** 2),
-            circularity=1.0,
-            source="track-hold",
-        )
-        cand.stack_count = int(track.get("stable_stack", 2))
-        cand.smoothed_stack_count = cand.stack_count
-        cand.raw_stack_count = 0
-        cand.height_used_mm = float(track.get("last_height", 0.0))
-        cand.track_id = int(track.get("id", -1))
-        cand.near_edge = bool(track.get("near_edge", False))
-        cand.near_corner = bool(track.get("near_corner", False))
-        cand.border_distance_px = float(track.get("border_distance_px", 9999.0))
-        cand.held_from_track = True
-        cand.confidence = 0.25
-        return cand
-
-    def update(self, candidates: List[ChipCandidate], *, chip_thickness_mm: float = 10.0) -> List[ChipCandidate]:
-        if not candidates:
-            held: List[ChipCandidate] = []
-            for tr in self._tracks:
-                tr["misses"] = int(tr.get("misses", 0)) + 1
-                if self._should_hold_track(tr):
-                    held.append(self._candidate_from_track(tr))
-            self._tracks = [tr for tr in self._tracks if int(tr.get("misses", 0)) <= self.max_misses]
-            return held
-
-        unmatched = set(range(len(self._tracks)))
         for cand in candidates:
-            best_i: Optional[int] = None
-            best_d = float("inf")
-            for i in list(unmatched):
-                tr = self._tracks[i]
-                d = float(np.hypot(cand.x - float(tr["x"]), cand.y - float(tr["y"])))
-                allowed = max(self.max_match_distance_px, 1.55 * max(cand.radius, float(tr.get("radius", cand.radius))))
-                if d <= allowed and d < best_d:
-                    best_d = d
-                    best_i = i
-            if best_i is None:
-                tr = {
-                    "id": self._next_id,
-                    "x": float(cand.x),
-                    "y": float(cand.y),
-                    "radius": float(cand.radius),
-                    "stack_history": deque(maxlen=self.window),
-                    "height_history": deque(maxlen=self.window),
-                    "stable_stack": int(cand.stack_count),
-                    "misses": 0,
-                    "chip_thickness_mm": float(chip_thickness_mm),
-                    "near_edge": bool(cand.near_edge),
-                    "near_corner": bool(cand.near_corner),
-                    "border_distance_px": float(cand.border_distance_px),
-                    "last_height": float(cand.height_used_mm),
-                }
-                self._next_id += 1
-                self._tracks.append(tr)
-            else:
-                tr = self._tracks[best_i]
-                unmatched.discard(best_i)
-                tr["x"] = 0.70 * float(tr["x"]) + 0.30 * float(cand.x)
-                tr["y"] = 0.70 * float(tr["y"]) + 0.30 * float(cand.y)
-                tr["radius"] = 0.75 * float(tr.get("radius", cand.radius)) + 0.25 * float(cand.radius)
-                tr["misses"] = 0
-                tr["chip_thickness_mm"] = float(chip_thickness_mm)
-                tr["near_edge"] = bool(tr.get("near_edge", False)) or bool(cand.near_edge)
-                tr["near_corner"] = bool(tr.get("near_corner", False)) or bool(cand.near_corner)
-                tr["border_distance_px"] = min(float(tr.get("border_distance_px", cand.border_distance_px)), float(cand.border_distance_px))
-                tr["last_height"] = float(cand.height_used_mm)
-
-            raw = int(cand.stack_count)
+            raw = int(np.clip(cand.stack_count, 1, 2))
             cand.raw_stack_count = raw
-            hist: Deque[int] = tr["stack_history"]  # type: ignore[assignment]
-            heights: Deque[float] = tr["height_history"]  # type: ignore[assignment]
-            hist.append(raw)
-            heights.append(float(cand.height_used_mm))
-            smooth = self._smooth_count(tr, raw, float(cand.height_used_mm))
-            tr["stable_stack"] = int(smooth)
-            cand.stack_count = int(smooth)
-            cand.smoothed_stack_count = int(smooth)
-            cand.track_id = int(tr["id"])
+            tid = self._match_track(cand, used)
+            used.add(tid)
+            active_ids.add(tid)
+            tr = self._tracks[tid]
 
-        held: List[ChipCandidate] = []
-        for i in unmatched:
-            self._tracks[i]["misses"] = int(self._tracks[i].get("misses", 0)) + 1
-            if self._should_hold_track(self._tracks[i]):
-                held.append(self._candidate_from_track(self._tracks[i]))
-        self._tracks = [tr for tr in self._tracks if int(tr.get("misses", 0)) <= self.max_misses]
-        if held:
-            candidates.extend(held)
+            raw_hist: Deque[int] = tr["raw_hist"]  # type: ignore[assignment]
+            height_hist: Deque[float] = tr["height_hist"]  # type: ignore[assignment]
+            raw_hist.append(raw)
+            height_hist.append(float(cand.height_used_mm))
+
+            prev = int(tr.get("stable", raw))
+            high_votes = sum(1 for r, h in zip(raw_hist, height_hist) if int(r) >= 2 or float(h) >= self.promote_height_mm)
+            low_votes = sum(1 for h in height_hist if float(h) <= self.demote_height_mm)
+            one_votes = sum(1 for r in raw_hist if int(r) <= 1)
+
+            if prev >= 2:
+                # Once a chip has become a two-stack, require repeated low-height
+                # evidence before demoting. This fixes 2 -> 1 flicker on edges.
+                if low_votes >= self.demote_votes and one_votes >= self.demote_votes:
+                    stable = 1
+                else:
+                    stable = 2
+            else:
+                if high_votes >= self.promote_votes:
+                    stable = 2
+                else:
+                    stable = 1
+
+            tr["stable"] = int(stable)
+            # Slowly update the track centre so it follows real candidate movement
+            # but does not jump wildly on a noisy frame.
+            tr["x"] = 0.65 * float(tr["x"]) + 0.35 * cand.x
+            tr["y"] = 0.65 * float(tr["y"]) + 0.35 * cand.y
+            tr["misses"] = 0
+
+            cand.track_id = tid
+            cand.stack_count = int(stable)
+
+        # Age unmatched tracks and remove old ones. Tracks are only used to smooth
+        # labels for candidates that are actually detected; held tracks are not
+        # hallucinated into the output.
+        for tid in list(self._tracks.keys()):
+            if tid not in active_ids:
+                self._tracks[tid]["misses"] = int(self._tracks[tid].get("misses", 0)) + 1
+                if int(self._tracks[tid]["misses"]) > self.hold_misses:
+                    del self._tracks[tid]
+
         return candidates
 
 def build_height_support_mask(
@@ -451,6 +337,7 @@ def build_height_support_mask(
     min_piece_height_mm: float,
     max_piece_height_mm: float,
     roi_frac: Optional[RoiFrac],
+    exclusion_fracs: RectFracs = (),
     noise_floor_mm: Optional[np.ndarray] = None,
     noise_margin_mm: float = 1.5,
     min_area_px: int = 24,
@@ -472,7 +359,7 @@ def build_height_support_mask(
         min_height_map = np.full_like(height_smooth, float(min_piece_height_mm), dtype=np.float32)
 
     raw = ((height_smooth >= min_height_map) & (height_smooth <= float(max_piece_height_mm)) & (valid_mask > 0)).astype(np.uint8) * 255
-    raw = cv2.bitwise_and(raw, _roi_mask(raw.shape[:2], roi_frac))
+    raw = cv2.bitwise_and(raw, _allowed_mask(raw.shape[:2], roi_frac, exclusion_fracs))
     raw = clean_mask(raw, open_px=1, close_px=3, min_area_px=max(4, int(min_area_px)))
     return raw
 
@@ -534,7 +421,7 @@ def _nms_candidates(candidates: List[ChipCandidate], min_center_dist_factor: flo
     return kept
 
 
-def _build_rgb_chip_mask(rgb_bgr: np.ndarray, roi_frac: Optional[RoiFrac]) -> np.ndarray:
+def _build_rgb_chip_mask(rgb_bgr: np.ndarray, roi_frac: Optional[RoiFrac], exclusion_fracs: RectFracs = ()) -> np.ndarray:
     """Bright low-saturation mask for the current pale/white diagnostic chips."""
     hsv = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
@@ -542,7 +429,7 @@ def _build_rgb_chip_mask(rgb_bgr: np.ndarray, roi_frac: Optional[RoiFrac]) -> np
     l, a, b = cv2.split(lab)
     # White/off-white chips: bright, relatively unsaturated, roughly neutral in Lab.
     mask = ((v >= 125) & (s <= 95) & (l >= 120) & (np.abs(a.astype(np.int16) - 128) <= 28) & (np.abs(b.astype(np.int16) - 128) <= 38)).astype(np.uint8) * 255
-    mask = cv2.bitwise_and(mask, _roi_mask(mask.shape[:2], roi_frac))
+    mask = cv2.bitwise_and(mask, _allowed_mask(mask.shape[:2], roi_frac, exclusion_fracs))
     mask = clean_mask(mask, open_px=3, close_px=5, min_area_px=30)
     return mask
 
@@ -583,12 +470,13 @@ def _rgb_circle_candidates(
     stable_support: np.ndarray,
     *,
     roi_frac: Optional[RoiFrac],
+    exclusion_fracs: RectFracs = (),
     expected_radius_px: float,
     min_radius_px: float,
     max_radius_px: float,
     split_touching: bool,
 ) -> Tuple[List[ChipCandidate], np.ndarray]:
-    rgb_mask = _build_rgb_chip_mask(rgb_bgr, roi_frac)
+    rgb_mask = _build_rgb_chip_mask(rgb_bgr, roi_frac, exclusion_fracs)
     n, labels, stats, cents = cv2.connectedComponentsWithStats(rgb_mask, connectivity=8)
     out: List[ChipCandidate] = []
     expected_area = float(np.pi * expected_radius_px * expected_radius_px)
@@ -691,6 +579,7 @@ def generate_restored_circle_candidates(
     use_hough: bool,
     split_touching: bool,
     roi_frac: Optional[RoiFrac],
+    exclusion_fracs: RectFracs = (),
 ) -> Tuple[List[ChipCandidate], np.ndarray, np.ndarray, int]:
     if expected_radius_px is None or expected_radius_px <= 0:
         expected_radius_px = (float(min_radius_px) + float(max_radius_px)) * 0.5
@@ -700,6 +589,7 @@ def generate_restored_circle_candidates(
         rgb_bgr,
         stable_support,
         roi_frac=roi_frac,
+        exclusion_fracs=exclusion_fracs,
         expected_radius_px=float(expected_radius_px),
         min_radius_px=min_radius_px,
         max_radius_px=max_radius_px,
@@ -763,26 +653,12 @@ def _height_values_in_candidate(
 
 
 def _estimate_stack_from_distribution(vals: np.ndarray, chip_thickness_mm: float, min_piece_height_mm: float, max_piece_height_mm: float, requested_height: float) -> Tuple[int, float]:
-    """Classify stack height from a height distribution with edge-stack tolerance.
-
-    Passive stereo often under-fills the top face of a stack near board edges. A
-    simple median can therefore read a two-high stack as one-high. This function
-    looks for band evidence near multiples of chip thickness and uses high
-    quantiles/top-band statistics as supporting evidence, while avoiding promotion
-    from a few isolated spikes.
-    """
+    """Classify stack height from the distribution, not from a few high spikes."""
     t = max(float(chip_thickness_mm), 1.0)
     vals = vals[np.isfinite(vals)]
     vals = vals[(vals >= max(1.0, min_piece_height_mm * 0.65)) & (vals <= max_piece_height_mm)]
     if vals.size == 0:
         return 0, 0.0
-
-    n = int(vals.size)
-    p75 = float(np.percentile(vals, 75))
-    p85 = float(np.percentile(vals, 85))
-    p90 = float(np.percentile(vals, 90))
-    top35 = _top_band_stat(vals, 0.35)
-    top25 = _top_band_stat(vals, 0.25)
 
     max_stack = max(1, min(8, int(np.ceil(max_piece_height_mm / t))))
     band_counts = []
@@ -795,41 +671,72 @@ def _estimate_stack_from_distribution(vals: np.ndarray, chip_thickness_mm: float
         band_counts.append(int(band.size))
         band_medians.append(float(np.median(band)) if band.size else centre)
 
-    # Strong normal case: enough samples in a thickness band.
     best_idx = int(np.argmax(band_counts))
     best_count = band_counts[best_idx]
     best_stack = best_idx + 1
-    if best_count >= max(4, int(0.22 * n)):
-        # If the one-chip band barely wins but the upper quantiles/top-band are
-        # clearly around two chips, keep the two-stack hypothesis alive.
-        if best_stack == 1 and max_stack >= 2:
-            two_count = band_counts[1]
-            two_like_height = max(float(requested_height), p85, top35)
-            if two_like_height >= 1.48 * t and two_count >= max(2, int(0.045 * n)):
-                return 2, max(two_like_height, band_medians[1])
+    n = int(vals.size)
+
+    if best_count >= max(3, int(0.18 * n)):
         return best_stack, band_medians[best_idx]
 
-    # Sparse/edge case: accept a two-stack when several height statistics agree,
-    # rather than requiring a dense top face.
-    if max_stack >= 2:
-        two_band = vals[(vals >= 1.35 * t) & (vals <= 2.65 * t)]
-        two_count = int(two_band.size)
-        two_like_height = max(float(requested_height), p85, p90, top35, top25)
-        enough_two_pixels = two_count >= max(2, int(0.04 * n))
-        not_just_one_spike = p75 >= 1.18 * t or two_count >= max(3, int(0.08 * n))
-        if two_like_height >= 1.48 * t and enough_two_pixels and not_just_one_spike:
-            return 2, float(np.median(two_band)) if two_band.size else two_like_height
-
-    # Conservative fallback from requested robust statistic.
+    # Fallback: use the requested robust statistic, but round conservatively. This
+    # helps very sparse edge stacks while avoiding single-chip overestimation.
     est = max(0, classify_stack_count(requested_height, t, min_piece_height_mm))
     if est > 1:
+        # Require at least some evidence in the estimated band.
         idx = min(est, len(band_counts)) - 1
-        # Do not promote to a taller stack purely from one or two isolated spikes.
-        if band_counts[idx] < max(2, int(0.04 * n)):
+        if band_counts[idx] < max(2, int(0.08 * n)) and band_counts[0] >= max(2, band_counts[idx]):
             est = 1
             requested_height = band_medians[0] if band_counts[0] else float(np.median(vals))
     return est, float(requested_height)
 
+
+
+def _estimate_stack_1_or_2(
+    vals: np.ndarray,
+    *,
+    min_piece_height_mm: float,
+    max_piece_height_mm: float,
+    promote_height_mm: float,
+    demote_height_mm: float,
+    requested_height: float,
+) -> Tuple[int, float]:
+    """Return only 0, 1, or 2 for this project.
+
+    The measured depth of a two-chip stack is often lower than the ideal 20 mm,
+    especially near board edges. Instead of rounding by chip thickness, this uses
+    a robust upper-band statistic and a lower promote threshold.
+    """
+    vals = vals[np.isfinite(vals)].astype(np.float32)
+    vals = vals[(vals >= max(1.0, min_piece_height_mm * 0.6)) & (vals <= max_piece_height_mm)]
+    if vals.size == 0:
+        return 0, 0.0
+
+    p50 = float(np.percentile(vals, 50))
+    p75 = float(np.percentile(vals, 75))
+    p90 = float(np.percentile(vals, 90))
+    top35 = _top_band_stat(vals, 0.35)
+    top25 = _top_band_stat(vals, 0.25)
+    used = max(float(requested_height), top35)
+
+    high_pixels = int(np.count_nonzero(vals >= promote_height_mm))
+    high_ratio = high_pixels / max(float(vals.size), 1.0)
+
+    # Promote on a robust top-face estimate, not a single spike. The p75/top35
+    # tests handle dense centre-board readings; p90 plus a few high pixels helps
+    # sparse edge/corner readings.
+    is_two = (
+        top35 >= promote_height_mm
+        or p75 >= promote_height_mm
+        or (p90 >= promote_height_mm and high_pixels >= max(2, int(0.05 * vals.size)))
+        or high_ratio >= 0.12
+    )
+
+    # A genuinely low top band is one-high. Borderline values are handled by the
+    # temporal smoother; without a smoother they remain conservative.
+    if not is_two and top25 <= demote_height_mm:
+        return 1, used
+    return (2 if is_two else 1), used
 
 def classify_rgb_candidates_by_depth(
     rgb_bgr: np.ndarray,
@@ -852,10 +759,12 @@ def classify_rgb_candidates_by_depth(
     min_support_pixels: int = 6,
     draw_rejected_candidates: bool = False,
     roi_frac: Optional[RoiFrac] = (0.18, 0.00, 0.88, 1.00),
+    middle_exclusion_frac: Optional[Tuple[float, float, float, float]] = (0.00, 0.40, 1.00, 0.60),
     temporal_filter: Optional[TemporalMaskFilter] = None,
-    stack_smoother: Optional[TemporalStackSmoother] = None,
+    stack_smoother: Optional[StackCountSmoother] = None,
+    stack_promote_height_mm: float = 16.5,
+    stack_demote_height_mm: float = 14.5,
     noise_margin_mm: float = 1.5,
-    edge_margin_px: float = 42.0,
 ) -> StackClassificationResult:
     height_mm, valid_overlap = baseline.height_above_board(depth_mm)
 
@@ -868,12 +777,15 @@ def classify_rgb_candidates_by_depth(
         valid_for_rgb = valid_overlap
         noise_floor = baseline.noise_floor_mm
 
+    exclusion_fracs: RectFracs = tuple(frac for frac in (middle_exclusion_frac,) if frac is not None)
+
     raw_support = build_height_support_mask(
         height_for_rgb,
         valid_for_rgb,
         min_piece_height_mm=min_piece_height_mm,
         max_piece_height_mm=max_piece_height_mm,
         roi_frac=roi_frac,
+        exclusion_fracs=exclusion_fracs,
         noise_floor_mm=noise_floor,
         noise_margin_mm=noise_margin_mm,
         min_area_px=max(3, min_support_pixels // 2),
@@ -892,10 +804,8 @@ def classify_rgb_candidates_by_depth(
         use_hough=use_hough,
         split_touching=split_touching,
         roi_frac=roi_frac,
+        exclusion_fracs=exclusion_fracs,
     )
-
-    for cand in candidates:
-        annotate_candidate_edge_context(cand, height_for_rgb.shape[:2], roi_frac, edge_margin_px=edge_margin_px)
 
     stat_getters = {
         "median": lambda v: float(np.median(v)),
@@ -908,10 +818,14 @@ def classify_rgb_candidates_by_depth(
 
     class_bgr = np.zeros((*rgb_bgr.shape[:2], 3), dtype=np.uint8)
     overlay = rgb_bgr.copy()
-    prelim_classified: List[ChipCandidate] = []
+    classified: List[ChipCandidate] = []
     rejected = 0
     vals_min = max(1.0, min_piece_height_mm * 0.60)
 
+    # First classify each candidate for this frame without drawing. Then apply
+    # stack-count smoothing across frames. Drawing after smoothing ensures the
+    # mask and overlay show the stable class, while labels still expose raw
+    # values for debugging.
     for cand in candidates:
         vals, depth_ratio = _height_values_in_candidate(
             height_for_rgb,
@@ -931,8 +845,15 @@ def classify_rgb_candidates_by_depth(
             cand.height_top35_mm = _top_band_stat(vals, 0.35)
             cand.height_top25_mm = _top_band_stat(vals, 0.25)
             requested_height = stat_getters[height_stat](vals)
-            cand.stack_count, cand.height_used_mm = _estimate_stack_from_distribution(vals, chip_thickness_mm, min_piece_height_mm, max_piece_height_mm, requested_height)
-            cand.raw_stack_count = int(cand.stack_count)
+            cand.stack_count, cand.height_used_mm = _estimate_stack_1_or_2(
+                vals,
+                min_piece_height_mm=min_piece_height_mm,
+                max_piece_height_mm=max_piece_height_mm,
+                promote_height_mm=stack_promote_height_mm,
+                demote_height_mm=stack_demote_height_mm,
+                requested_height=requested_height,
+            )
+            cand.raw_stack_count = cand.stack_count
             cand.confidence = min(
                 1.0,
                 0.45 * min(1.0, depth_ratio / 0.12)
@@ -940,41 +861,50 @@ def classify_rgb_candidates_by_depth(
                 + 0.20 * min(1.0, cand.support_ratio / max(min_candidate_support_ratio, 1e-6)),
             )
         else:
-            cand.stack_count = 0
             cand.raw_stack_count = 0
+            cand.stack_count = 0
             cand.confidence = 0.0
 
         if cand.stack_count <= 0:
             rejected += 1
-            if draw_rejected_candidates:
-                cx, cy, r = int(round(cand.x)), int(round(cand.y)), max(2, int(round(cand.radius)))
-                cv2.circle(overlay, (cx, cy), r, (80, 80, 80), 1)
-                cv2.putText(overlay, "?", (cx - 5, cy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
-            continue
+        else:
+            classified.append(cand)
 
-        prelim_classified.append(cand)
-
-    classified = stack_smoother.update(prelim_classified, chip_thickness_mm=chip_thickness_mm) if stack_smoother is not None else prelim_classified
+    if stack_smoother is not None:
+        classified = stack_smoother.update(classified)
 
     for cand in classified:
         cx, cy, r = int(round(cand.x)), int(round(cand.y)), max(2, int(round(cand.radius)))
         if cand.stack_count == 1:
             colour = (0, 220, 0)
             label = "1"
-        elif cand.stack_count == 2:
+        else:
             colour = (0, 220, 255)
             label = "2"
-        else:
-            colour = (0, 0, 255)
-            label = str(cand.stack_count)
 
         cv2.circle(class_bgr, (cx, cy), r, colour, -1)
         cv2.circle(overlay, (cx, cy), r, colour, 2)
         cv2.putText(overlay, label, (cx - 8, cy + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.60, colour, 2, cv2.LINE_AA)
-        raw_note = f" r{cand.raw_stack_count}" if cand.raw_stack_count and cand.raw_stack_count != cand.stack_count else ""
-        edge_note = " C" if cand.near_corner else (" E" if cand.near_edge else "")
-        hold_note = " H" if cand.held_from_track else ""
-        cv2.putText(overlay, f"{cand.height_used_mm:.1f}mm{raw_note} T{cand.track_id}{edge_note}{hold_note}", (cx - 38, cy + r + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.34, colour, 1, cv2.LINE_AA)
+        raw_note = f"r{cand.raw_stack_count}" if cand.raw_stack_count and cand.raw_stack_count != cand.stack_count else ""
+        track_note = f" T{cand.track_id}" if cand.track_id >= 0 else ""
+        cv2.putText(
+            overlay,
+            f"{cand.height_used_mm:.1f}mm {raw_note}{track_note}",
+            (cx - 34, cy + r + 13),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.34,
+            colour,
+            1,
+            cv2.LINE_AA,
+        )
+
+    if draw_rejected_candidates:
+        for cand in candidates:
+            if cand.stack_count > 0:
+                continue
+            cx, cy, r = int(round(cand.x)), int(round(cand.y)), max(2, int(round(cand.radius)))
+            cv2.circle(overlay, (cx, cy), r, (80, 80, 80), 1)
+            cv2.putText(overlay, "?", (cx - 5, cy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1, cv2.LINE_AA)
 
     filtered_circle_mask = np.zeros_like(restored_circle_mask)
     for cand in classified:
@@ -994,10 +924,8 @@ def classify_rgb_candidates_by_depth(
         "split_touching_enabled": float(bool(split_touching)),
         "min_candidate_support_ratio": float(min_candidate_support_ratio),
         "temporal_history": float(temporal_filter.history_size if temporal_filter is not None else 0),
-        "stack_temporal_tracks": float(stack_smoother.track_count if stack_smoother is not None else 0),
-        "edge_candidate_count": float(sum(1 for c in classified if c.near_edge)),
-        "corner_candidate_count": float(sum(1 for c in classified if c.near_corner)),
-        "held_candidate_count": float(sum(1 for c in classified if c.held_from_track)),
+        "stack_promote_height_mm": float(stack_promote_height_mm),
+        "stack_demote_height_mm": float(stack_demote_height_mm),
     }
 
     return StackClassificationResult(

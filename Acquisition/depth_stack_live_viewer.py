@@ -42,7 +42,7 @@ print(f"Loaded depth_stack_classifier from: {_classifier_path}")
 
 EmptyBoardBaseline = _dsc.EmptyBoardBaseline
 TemporalMaskFilter = _dsc.TemporalMaskFilter
-TemporalStackSmoother = _dsc.TemporalStackSmoother
+StackCountSmoother = _dsc.StackCountSmoother
 classify_rgb_candidates_by_depth = _dsc.classify_rgb_candidates_by_depth
 depth_to_gray_fixed = _dsc.depth_to_gray_fixed
 height_to_gray = _dsc.height_to_gray
@@ -79,7 +79,10 @@ class Config:
     min_support_pixels: int = 6
     min_depth_pixels: int = 8
     min_depth_ratio: float = 0.025
-    roi_frac: RoiFrac = (0.18, 0.00, 0.88, 1.00)
+    roi_frac: RoiFrac = (0.20, 0.00, 0.82, 1.00)
+    # Exclude the central horizontal dice strip from stack/chip detection.
+    # Format x1,y1,x2,y2 as fractions of the viewer image. Use "none" to disable.
+    middle_exclusion_frac: RoiFrac = (0.00, 0.40, 1.00, 0.60)
 
     temporal_enabled: bool = True
     temporal_window: int = 3
@@ -89,15 +92,15 @@ class Config:
     temporal_min_area_px: int = 30
     noise_margin_mm: float = 1.5
 
-    stack_temporal_enabled: bool = True
+    # Stack-count hysteresis. Chips only go up to 2-high in this project.
+    # Promote to 2 at this height, but only demote back to 1 after repeated
+    # lower-height evidence. This prevents green/yellow flicker.
+    stack_promote_height_mm: float = 16.5
+    stack_demote_height_mm: float = 14.5
     stack_temporal_window: int = 5
     stack_promote_votes: int = 2
     stack_demote_votes: int = 4
-    stack_match_distance_px: float = 24.0
     stack_hold_misses: int = 2
-    edge_margin_px: float = 42.0
-    edge_promote_height_factor: float = 1.30
-    edge_demote_height_factor: float = 1.18
 
     record: bool = False
     record_every: int = 3
@@ -232,7 +235,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-support-pixels", type=int, default=6)
     ap.add_argument("--min-depth-pixels", type=int, default=8)
     ap.add_argument("--min-depth-ratio", type=float, default=0.025)
-    ap.add_argument("--roi-frac", type=parse_roi_frac, default=(0.18, 0.00, 0.88, 1.00))
+    ap.add_argument("--roi-frac", type=parse_roi_frac, default=(0.10, 0.00, 1.00, 1.00))
+    ap.add_argument("--middle-exclusion-frac", type=parse_roi_frac, default=(0.00, 0.38, 1.00, 0.60), help="Rectangular region to exclude from chip/stack detection, e.g. dice strip. Use 'none' to disable.")
 
     ap.add_argument("--disable-temporal", dest="temporal_enabled", action="store_false", default=True)
     ap.add_argument("--temporal-window", type=int, default=3)
@@ -241,16 +245,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--temporal-close-px", type=int, default=5)
     ap.add_argument("--temporal-min-area-px", type=int, default=30)
     ap.add_argument("--noise-margin-mm", type=float, default=1.5)
-
-    ap.add_argument("--disable-stack-temporal", dest="stack_temporal_enabled", action="store_false", default=True)
+    ap.add_argument("--stack-promote-height-mm", type=float, default=16.5, help="Height at/above which a candidate can promote to a 2-high stack.")
+    ap.add_argument("--stack-demote-height-mm", type=float, default=14.5, help="Height below which repeated evidence can demote a 2-high stack back to 1-high.")
     ap.add_argument("--stack-temporal-window", type=int, default=5)
     ap.add_argument("--stack-promote-votes", type=int, default=2)
     ap.add_argument("--stack-demote-votes", type=int, default=4)
-    ap.add_argument("--stack-match-distance-px", type=float, default=24.0)
-    ap.add_argument("--stack-hold-misses", type=int, default=2, help="Hold an edge/corner two-stack for this many missed frames to prevent brief corner dropouts.")
-    ap.add_argument("--edge-margin-px", type=float, default=42.0, help="Pixels from ROI/image boundary treated as edge/corner for stack hysteresis.")
-    ap.add_argument("--edge-promote-height-factor", type=float, default=1.30, help="Near-edge height/chip-thickness ratio that counts as two-stack evidence.")
-    ap.add_argument("--edge-demote-height-factor", type=float, default=1.18, help="Near-edge height/chip-thickness ratio below which demotion may occur after enough votes.")
+    ap.add_argument("--stack-hold-misses", type=int, default=2)
 
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--record-every", type=int, default=3)
@@ -274,18 +274,15 @@ def main(argv: Optional[List[str]] = None) -> None:
             min_area_px=cfg.temporal_min_area_px,
         )
 
-    stack_smoother = None
-    if cfg.stack_temporal_enabled:
-        stack_smoother = TemporalStackSmoother(
-            window=cfg.stack_temporal_window,
-            promote_votes=cfg.stack_promote_votes,
-            demote_votes=cfg.stack_demote_votes,
-            max_match_distance_px=cfg.stack_match_distance_px,
-            hold_misses=cfg.stack_hold_misses,
-            edge_margin_px=cfg.edge_margin_px,
-            edge_promote_height_factor=cfg.edge_promote_height_factor,
-            edge_demote_height_factor=cfg.edge_demote_height_factor,
-        )
+    stack_smoother = StackCountSmoother(
+        window=cfg.stack_temporal_window,
+        promote_votes=cfg.stack_promote_votes,
+        demote_votes=cfg.stack_demote_votes,
+        hold_misses=cfg.stack_hold_misses,
+        promote_height_mm=cfg.stack_promote_height_mm,
+        demote_height_mm=cfg.stack_demote_height_mm,
+        match_distance_px=max(24.0, (cfg.expected_chip_radius_px or cfg.max_chip_radius_px) * 1.5),
+    )
 
     cam = OakSRStreams(
         enable_left=True,
@@ -316,8 +313,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 baseline.add_sample(depth)
                 if temporal_filter is not None:
                     temporal_filter.reset()
-                if stack_smoother is not None:
-                    stack_smoother.reset()
+                stack_smoother.reset()
                 status = np.zeros((*left.shape[:2], 3), dtype=np.uint8)
                 cv2.putText(status, f"Capturing empty-board baseline: {len(baseline.samples)}/{cfg.baseline_frames}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
                 cv2.putText(status, "Keep board empty and still. Press b to restart baseline.", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
@@ -343,10 +339,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                     min_support_pixels=cfg.min_support_pixels,
                     draw_rejected_candidates=cfg.draw_rejected_candidates,
                     roi_frac=cfg.roi_frac,
+                    middle_exclusion_frac=cfg.middle_exclusion_frac,
                     temporal_filter=temporal_filter,
                     stack_smoother=stack_smoother,
+                    stack_promote_height_mm=cfg.stack_promote_height_mm,
+                    stack_demote_height_mm=cfg.stack_demote_height_mm,
                     noise_margin_mm=cfg.noise_margin_mm,
-                    edge_margin_px=cfg.edge_margin_px,
                 )
                 height_bw = height_to_gray(result.height_mm, cfg.height_max_visual_mm)
                 valid = result.valid_overlap_mask * 255
@@ -359,8 +357,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     f"raw={result.diagnostics['raw_support_ratio']:.4f} "
                     f"stable={result.diagnostics['stable_support_ratio']:.4f} "
                     f"T={int(result.diagnostics['temporal_history'])}/{cfg.temporal_window if cfg.temporal_enabled else 0} "
-                    f"S={int(result.diagnostics.get('stack_temporal_tracks', 0))} "
-                    f"held={int(result.diagnostics.get('held_candidate_count', 0))}"
+                    f"2@{cfg.stack_promote_height_mm:.1f}/1@{cfg.stack_demote_height_mm:.1f}"
                 )
                 cv2.putText(stack_overlay, text, (10, stack_overlay.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
                 views.extend([
@@ -399,8 +396,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 baseline.clear()
                 if temporal_filter is not None:
                     temporal_filter.reset()
-                if stack_smoother is not None:
-                    stack_smoother.reset()
+                stack_smoother.reset()
                 print("Baseline cleared. Keep board empty and still.")
             frame_i += 1
     finally:

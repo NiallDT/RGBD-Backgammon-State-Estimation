@@ -68,7 +68,7 @@ class OakSRKeyframeGate:
         min_keyframe_delta: float = 1.5,
         hand_near_mm: int = 450,
         min_valid_mm: int = 80,
-        max_invalid_ratio: float = 0.35,
+        max_invalid_ratio: float = 0.80,
         max_near_ratio: float = 0.03,
         ema_alpha: float = 0.2,
         wb_strength: float = 1.0,
@@ -234,7 +234,25 @@ class OakSRKeyframeGate:
         target_shape_hw: Tuple[int, int],
     ) -> Tuple[np.ndarray, np.ndarray, float, float, bool]:
         valid_mask = (depth_raw >= self.min_valid_mm).astype(np.uint8)
-        near_mask = ((depth_raw >= self.min_valid_mm) & (depth_raw < self.hand_near_mm)).astype(np.uint8)
+
+        # Use a dynamic near-field threshold relative to the current board depth.
+        # The earlier fixed threshold (e.g. 450 mm) treated most of the board as
+        # an occluder when the board itself was around 390-430 mm from camera.
+        # Here, only things substantially closer than the median board/ROI depth
+        # are classed as near occlusions. This should catch hands while not
+        # rejecting the board or normal checker stacks.
+        roi_depth = self._extract_roi(depth_raw)
+        roi_valid = roi_depth[roi_depth >= self.min_valid_mm]
+        if roi_valid.size > 0:
+            board_median_mm = float(np.median(roi_valid))
+            dynamic_near_mm = min(float(self.hand_near_mm), board_median_mm - 40.0)
+        else:
+            dynamic_near_mm = float(self.hand_near_mm)
+
+        near_mask = (
+            (depth_raw >= self.min_valid_mm)
+            & (depth_raw < dynamic_near_mm)
+        ).astype(np.uint8)
 
         kernel = np.ones((5, 5), np.uint8)
         near_mask = cv2.morphologyEx(near_mask * 255, cv2.MORPH_OPEN, kernel)
@@ -355,7 +373,7 @@ if __name__ == "__main__":
         min_keyframe_delta=1.5,
         hand_near_mm=450,
         max_near_ratio=0.03,
-        max_invalid_ratio=0.35,
+        max_invalid_ratio=0.80,
     ).start()
 
     try:

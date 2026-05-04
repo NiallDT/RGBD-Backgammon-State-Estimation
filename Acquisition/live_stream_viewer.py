@@ -62,7 +62,6 @@ class LiveViewConfig:
     max_piece_height_mm: float = 40.0
     min_piece_area_px: int = 80
     height_max_mm: float = 35.0
-
     auto_baseline: bool = True
     auto_baseline_frames: int = 30
     baseline_min_valid_ratio: float = 0.20
@@ -153,6 +152,7 @@ def add_label(image_bgr: np.ndarray, label: str, *, ok: Optional[bool] = None) -
     return out
 
 
+
 def sanitise_filename(text: str) -> str:
     """Make a stream/view label safe for use as a filename."""
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", text.strip().lower())
@@ -161,7 +161,7 @@ def sanitise_filename(text: str) -> str:
 
 
 def render_view_cell(label: str, image: np.ndarray, ok: Optional[bool], cell_size: Size) -> np.ndarray:
-    """Render one named view exactly like a dashboard cell."""
+    """Render one named view exactly like a dashboard grid cell."""
     bgr = ensure_bgr(image)
     cell = resize_letterbox(bgr, cell_size)
     return add_label(cell, label, ok=ok)
@@ -263,6 +263,119 @@ def build_piece_height_mask(
     return cleaned
 
 
+class DepthBaselineModel:
+    """
+    Empty-board baseline model for board/chip height diagnostics.
+
+    This is deliberately independent of board registration. It works directly
+    on the cropped/full-frame depth stream, so it is available even when the
+    geometric preprocessing/rectification stage has not locked the board yet.
+    """
+
+    def __init__(
+        self,
+        *,
+        frames_required: int = 30,
+        min_valid_ratio: float = 0.20,
+        height_max_mm: float = 35.0,
+        min_piece_height_mm: float = 3.0,
+        max_piece_height_mm: float = 40.0,
+        min_piece_area_px: int = 80,
+    ) -> None:
+        self.frames_required = max(1, int(frames_required))
+        self.min_valid_ratio = float(min_valid_ratio)
+        self.height_max_mm = float(height_max_mm)
+        self.min_piece_height_mm = float(min_piece_height_mm)
+        self.max_piece_height_mm = float(max_piece_height_mm)
+        self.min_piece_area_px = int(min_piece_area_px)
+
+        self.baseline_depth_mm: Optional[np.ndarray] = None
+        self._samples: List[np.ndarray] = []
+        self._capture_requested = False
+        self.status = "baseline: collecting empty-board frames"
+
+    def clear(self) -> None:
+        self.baseline_depth_mm = None
+        self._samples.clear()
+        self._capture_requested = True
+        self.status = "baseline: cleared, collecting"
+
+    def request_capture(self) -> None:
+        self.baseline_depth_mm = None
+        self._samples.clear()
+        self._capture_requested = True
+        self.status = "baseline: capture requested"
+
+    @property
+    def ready(self) -> bool:
+        return self.baseline_depth_mm is not None
+
+    def update(self, depth_mm: np.ndarray, *, allow_auto_capture: bool = True) -> None:
+        if depth_mm is None:
+            return
+        if self.ready and not self._capture_requested:
+            return
+        if not allow_auto_capture and not self._capture_requested:
+            return
+
+        valid_ratio = float(np.count_nonzero(depth_mm > 0)) / float(depth_mm.size)
+        if valid_ratio < self.min_valid_ratio:
+            self.status = f"baseline: waiting for valid depth ({valid_ratio:.2f})"
+            return
+
+        self._samples.append(depth_mm.copy())
+        self.status = f"baseline: collecting {len(self._samples)}/{self.frames_required}"
+
+        if len(self._samples) < self.frames_required:
+            return
+
+        stack = np.stack([np.where(f > 0, f.astype(np.float32), np.nan) for f in self._samples], axis=0)
+        baseline = np.nanmedian(stack, axis=0)
+        baseline[np.isnan(baseline)] = 0
+        self.baseline_depth_mm = baseline.astype(np.float32)
+        self._samples.clear()
+        self._capture_requested = False
+
+        valid_ratio = float(np.count_nonzero(self.baseline_depth_mm > 0)) / float(self.baseline_depth_mm.size)
+        self.status = f"baseline: ready valid={valid_ratio:.2f}"
+
+    def compute(self, depth_mm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Returns: height_mm, height_uint8, piece_mask, overlap_valid_mask.
+        """
+        if self.baseline_depth_mm is None:
+            blank = np.zeros(depth_mm.shape[:2], dtype=np.uint8)
+            return np.zeros(depth_mm.shape[:2], dtype=np.float32), blank, blank, blank
+
+        depth = depth_mm.astype(np.float32)
+        baseline = self.baseline_depth_mm
+        if baseline.shape != depth.shape:
+            baseline = cv2.resize(baseline, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        current_valid = depth > 0
+        baseline_valid = baseline > 0
+        overlap_valid = current_valid & baseline_valid
+
+        height = baseline - depth
+        height[height < 0] = 0
+        height[~overlap_valid] = 0
+
+        height_vis = np.clip(height, 0, max(1.0, self.height_max_mm))
+        height_uint8 = (height_vis * 255.0 / max(1.0, self.height_max_mm)).astype(np.uint8)
+        height_uint8[~overlap_valid] = 0
+
+        piece_mask = build_piece_height_mask(
+            height,
+            overlap_valid.astype(np.uint8),
+            min_height_mm=self.min_piece_height_mm,
+            max_height_mm=self.max_piece_height_mm,
+            min_area_px=self.min_piece_area_px,
+        )
+
+        return height.astype(np.float32), height_uint8, piece_mask, overlap_valid.astype(np.uint8) * 255
+
+
+
 def blend_overlay(base_bgr: np.ndarray, overlay_bgr: np.ndarray, alpha: float = 0.45) -> np.ndarray:
     """Blend a sparse overlay onto a base image."""
     if overlay_bgr.shape[:2] != base_bgr.shape[:2]:
@@ -272,273 +385,6 @@ def blend_overlay(base_bgr: np.ndarray, overlay_bgr: np.ndarray, alpha: float = 
     out[mask] = cv2.addWeighted(base_bgr, 1.0 - alpha, overlay_bgr, alpha, 0)[mask]
     return out
 
-
-
-class EmptyBoardBaseline:
-    """Maintains an empty-board depth baseline and produces height/mask diagnostics."""
-
-    def __init__(
-        self,
-        *,
-        frames_required: int = 30,
-        min_valid_ratio: float = 0.20,
-        min_piece_height_mm: float = 3.0,
-        max_piece_height_mm: float = 40.0,
-        min_piece_area_px: int = 80,
-        height_max_mm: float = 35.0,
-    ) -> None:
-        self.frames_required = max(1, int(frames_required))
-        self.min_valid_ratio = float(min_valid_ratio)
-        self.min_piece_height_mm = float(min_piece_height_mm)
-        self.max_piece_height_mm = float(max_piece_height_mm)
-        self.min_piece_area_px = int(min_piece_area_px)
-        self.height_max_mm = float(height_max_mm)
-        self.samples: List[np.ndarray] = []
-        self.baseline: Optional[np.ndarray] = None
-        self.ready = False
-
-    def reset(self) -> None:
-        self.samples.clear()
-        self.baseline = None
-        self.ready = False
-
-    def clear_samples_only(self) -> None:
-        self.samples.clear()
-
-    def add_empty_frame(self, depth_mm: np.ndarray) -> None:
-        if self.ready:
-            return
-        valid_ratio = float(np.count_nonzero(depth_mm)) / float(depth_mm.size) if depth_mm.size else 0.0
-        if valid_ratio < self.min_valid_ratio:
-            return
-        self.samples.append(depth_mm.copy())
-        if len(self.samples) >= self.frames_required:
-            stack = []
-            for sample in self.samples:
-                f = sample.astype(np.float32)
-                f[f == 0] = np.nan
-                stack.append(f)
-            arr = np.stack(stack, axis=0)
-            baseline = np.nanmedian(arr, axis=0)
-            baseline[np.isnan(baseline)] = 0
-            self.baseline = baseline.astype(np.float32)
-            self.ready = True
-            self.samples.clear()
-            valid = 100.0 * float(np.count_nonzero(self.baseline)) / float(self.baseline.size)
-            print(f"Empty-board baseline captured. Valid baseline pixels: {valid:.1f}%")
-
-    def compute(self, depth_mm: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if self.baseline is None:
-            h, w = depth_mm.shape[:2]
-            blank = np.zeros((h, w), dtype=np.uint8)
-            return np.zeros((h, w), dtype=np.float32), blank, blank, blank
-
-        current = depth_mm.astype(np.float32)
-        baseline = self.baseline
-        if current.shape != baseline.shape:
-            baseline = cv2.resize(baseline, (current.shape[1], current.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-        current_valid = current > 0
-        baseline_valid = baseline > 0
-        overlap = current_valid & baseline_valid
-
-        height = baseline - current
-        height[height < 0] = 0
-        height[~overlap] = 0
-        height[np.isnan(height)] = 0
-
-        height_uint8 = np.clip(height, 0, max(1.0, self.height_max_mm)).astype(np.float32)
-        height_uint8 = (height_uint8 * 255.0 / max(1.0, self.height_max_mm)).astype(np.uint8)
-        height_uint8[~overlap] = 0
-
-        piece_mask = build_piece_height_mask(
-            height,
-            overlap.astype(np.uint8) * 255,
-            min_height_mm=self.min_piece_height_mm,
-            max_height_mm=self.max_piece_height_mm,
-            min_area_px=self.min_piece_area_px,
-        )
-        overlap_mask = overlap.astype(np.uint8) * 255
-        return height.astype(np.float32), height_uint8, piece_mask, overlap_mask
-
-    def build_views(self, depth_mm: np.ndarray) -> List[Tuple[str, np.ndarray, Optional[bool]]]:
-        if not self.ready:
-            h, w = depth_mm.shape[:2]
-            status = np.zeros((h, w, 3), dtype=np.uint8)
-            cv2.putText(status, "empty-board baseline not ready", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(status, f"captured {len(self.samples)}/{self.frames_required} frames", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(status, "leave board empty, or press b to restart", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
-            return [("baseline status", status, False)]
-
-        _, height_uint8, piece_mask, overlap_mask = self.compute(depth_mm)
-        return [
-            ("baseline valid-overlap mask", overlap_mask, True),
-            ("baseline height above board", height_uint8, True),
-            ("baseline pre-CNN piece mask", piece_mask, True),
-        ]
-
-
-class DiagnosticRecorder:
-    """Records the dashboard, individual named views, metadata and optional raw arrays."""
-
-    def __init__(self, config: LiveViewConfig) -> None:
-        self.config = config
-        self.active = bool(config.record)
-        self.session_dir: Optional[Path] = None
-        self.view_dir: Optional[Path] = None
-        self.raw_dir: Optional[Path] = None
-        self.writers: Dict[str, cv2.VideoWriter] = {}
-        self.frame_counter = 0
-        self.recorded_counter = 0
-        self.metadata_file = None
-        self.fourcc = cv2.VideoWriter_fourcc(*config.record_codec)
-        if self.active:
-            self.start()
-
-    def start(self) -> None:
-        if self.active and self.session_dir is not None:
-            return
-        stamp = datetime.now().strftime("live_view_%Y%m%d_%H%M%S")
-        self.session_dir = self.config.record_dir / stamp
-        self.view_dir = self.session_dir / "views"
-        self.raw_dir = self.session_dir / "raw_npz"
-        self.view_dir.mkdir(parents=True, exist_ok=True)
-        if self.config.record_raw_npz:
-            self.raw_dir.mkdir(parents=True, exist_ok=True)
-
-        info = {
-            "started_at": stamp,
-            "mode": self.config.mode,
-            "fps": self.config.fps,
-            "view_size": list(self.config.view_size),
-            "grid_cell_size": list(self.config.grid_cell_size),
-            "grid_columns": self.config.grid_columns,
-            "record_every": self.config.record_every,
-            "record_dashboard": self.config.record_dashboard,
-            "record_views": self.config.record_views,
-            "record_raw_npz": self.config.record_raw_npz,
-            "record_codec": self.config.record_codec,
-            "notes": "Videos are 8-bit BGR diagnostic views. raw_npz contains exact arrays when enabled.",
-        }
-        (self.session_dir / "session_info.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
-        self.metadata_file = (self.session_dir / "metadata.jsonl").open("a", encoding="utf-8")
-        self.active = True
-        print(f"Recording started: {self.session_dir}")
-
-    def stop(self) -> None:
-        for writer in self.writers.values():
-            writer.release()
-        self.writers.clear()
-        if self.metadata_file is not None:
-            self.metadata_file.close()
-            self.metadata_file = None
-        if self.active and self.session_dir is not None:
-            print(f"Recording stopped: {self.session_dir}")
-        self.active = False
-
-    def toggle(self) -> None:
-        if self.active:
-            self.stop()
-        else:
-            self.start()
-
-    def _writer(self, name: str, frame_bgr: np.ndarray) -> cv2.VideoWriter:
-        if self.session_dir is None:
-            self.start()
-        assert self.session_dir is not None
-        if name in self.writers:
-            return self.writers[name]
-        h, w = frame_bgr.shape[:2]
-        path = self.session_dir / f"{sanitise_filename(name)}.mp4" if name == "dashboard" else self.view_dir / f"{sanitise_filename(name)}.mp4"
-        writer = cv2.VideoWriter(str(path), self.fourcc, max(1.0, self.config.fps / max(1, self.config.record_every)), (w, h))
-        if not writer.isOpened():
-            raise RuntimeError(f"Could not open video writer for {path}")
-        self.writers[name] = writer
-        return writer
-
-    def record_frame(
-        self,
-        *,
-        packet: KeyframePacket,
-        views: List[Tuple[str, np.ndarray, Optional[bool]]],
-        dashboard: np.ndarray,
-        right_frame: Optional[np.ndarray],
-    ) -> None:
-        if not self.active:
-            return
-        self.frame_counter += 1
-        if (self.frame_counter - 1) % max(1, self.config.record_every) != 0:
-            return
-
-        self.recorded_counter += 1
-        if self.config.record_dashboard:
-            self._writer("dashboard", ensure_bgr(dashboard)).write(ensure_bgr(dashboard))
-
-        if self.config.record_views:
-            for label, image, ok in views:
-                cell = render_view_cell(label, image, ok, self.config.grid_cell_size)
-                self._writer(label, cell).write(cell)
-
-        if self.metadata_file is not None:
-            row = {
-                "recorded_index": self.recorded_counter,
-                "frame_index": int(packet.frame_index),
-                "timestamp": float(packet.timestamp),
-                "stable": bool(packet.stable),
-                "occluded": bool(packet.occluded),
-                "keyframe": bool(packet.keyframe),
-                "motion_score": float(packet.motion_score),
-                "rgb_motion_score": float(packet.rgb_motion_score),
-                "depth_motion_score": float(packet.depth_motion_score),
-                "near_ratio": float(packet.near_ratio),
-                "invalid_ratio": float(packet.invalid_ratio),
-                "views": [label for label, _, _ in views],
-            }
-            self.metadata_file.write(json.dumps(row) + "\n")
-            self.metadata_file.flush()
-
-        if self.config.record_raw_npz and self.raw_dir is not None:
-            raw_path = self.raw_dir / f"frame_{self.recorded_counter:06d}.npz"
-            np.savez_compressed(
-                raw_path,
-                left_raw=packet.left_raw,
-                left_norm=packet.left_norm,
-                left_gray=packet.left_gray,
-                right_raw=right_frame if right_frame is not None else np.array([], dtype=np.uint8),
-                depth_raw_mm=packet.depth_raw,
-                depth_gray=packet.depth_gray,
-                depth_valid_mask=packet.depth_valid_mask,
-                near_mask=packet.near_mask,
-            )
-
-    def save_snapshot(
-        self,
-        *,
-        packet: KeyframePacket,
-        views: List[Tuple[str, np.ndarray, Optional[bool]]],
-        dashboard: np.ndarray,
-        right_frame: Optional[np.ndarray],
-    ) -> None:
-        if self.session_dir is None:
-            self.start()
-        assert self.session_dir is not None
-        snap_dir = self.session_dir / f"snapshot_{datetime.now().strftime('%H%M%S_%f')}"
-        snap_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(snap_dir / "dashboard.png"), ensure_bgr(dashboard))
-        for label, image, ok in views:
-            cv2.imwrite(str(snap_dir / f"{sanitise_filename(label)}.png"), render_view_cell(label, image, ok, self.config.grid_cell_size))
-        np.savez_compressed(
-            snap_dir / "raw_packet.npz",
-            left_raw=packet.left_raw,
-            left_norm=packet.left_norm,
-            left_gray=packet.left_gray,
-            right_raw=right_frame if right_frame is not None else np.array([], dtype=np.uint8),
-            depth_raw_mm=packet.depth_raw,
-            depth_gray=packet.depth_gray,
-            depth_valid_mask=packet.depth_valid_mask,
-            near_mask=packet.near_mask,
-        )
-        print(f"Snapshot saved: {snap_dir}")
 
 class PreprocessingPreview:
     """Runs the pre-CNN geometric/visual pipeline for live diagnostics."""
@@ -602,6 +448,213 @@ class PreprocessingPreview:
         return views
 
 
+
+class DiagnosticRecorder:
+    """
+    Records the live diagnostic views for troubleshooting.
+
+    When active it can save:
+      - dashboard.mp4: the combined viewer exactly as displayed
+      - views/*.mp4: one labelled video per stream/view
+      - raw_npz/*.npz: optional exact numeric arrays from the keyframe packet
+      - metadata.jsonl: one JSON record per saved frame
+
+    Use the `r` key in the live viewer to toggle recording.
+    """
+
+    def __init__(self, config: LiveViewConfig) -> None:
+        self.config = config
+        self.active = False
+        self.session_dir: Optional[Path] = None
+        self.views_dir: Optional[Path] = None
+        self.raw_dir: Optional[Path] = None
+        self._writers: Dict[str, cv2.VideoWriter] = {}
+        self._metadata_file = None
+        self._saved_frame_count = 0
+        self._seen_view_names: set[str] = set()
+
+    @property
+    def saved_frame_count(self) -> int:
+        return self._saved_frame_count
+
+    def start(self) -> Path:
+        if self.active and self.session_dir is not None:
+            return self.session_dir
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_dir = Path(self.config.record_dir) / f"live_view_{timestamp}"
+        self.views_dir = self.session_dir / "views"
+        self.raw_dir = self.session_dir / "raw_npz"
+        self.views_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.record_raw_npz:
+            self.raw_dir.mkdir(parents=True, exist_ok=True)
+
+        session_info = {
+            "started_at": timestamp,
+            "mode": self.config.mode,
+            "fps": self.config.fps,
+            "view_size": list(self.config.view_size),
+            "grid_cell_size": list(self.config.grid_cell_size),
+            "grid_columns": self.config.grid_columns,
+            "record_every": self.config.record_every,
+            "record_dashboard": self.config.record_dashboard,
+            "record_views": self.config.record_views,
+            "record_raw_npz": self.config.record_raw_npz,
+            "record_codec": self.config.record_codec,
+            "notes": "Videos are 8-bit BGR diagnostic views. raw_npz contains exact arrays when enabled.",
+        }
+        (self.session_dir / "session_info.json").write_text(json.dumps(session_info, indent=2), encoding="utf-8")
+        self._metadata_file = (self.session_dir / "metadata.jsonl").open("a", encoding="utf-8")
+        self.active = True
+        self._saved_frame_count = 0
+        print(f"Recording started: {self.session_dir}")
+        return self.session_dir
+
+    def stop(self) -> None:
+        if not self.active:
+            return
+        for writer in self._writers.values():
+            writer.release()
+        self._writers.clear()
+        if self._metadata_file is not None:
+            self._metadata_file.close()
+            self._metadata_file = None
+        print(f"Recording stopped: {self.session_dir} ({self._saved_frame_count} saved frames)")
+        self.active = False
+
+    def toggle(self) -> None:
+        if self.active:
+            self.stop()
+        else:
+            self.start()
+
+    def _video_fps(self) -> float:
+        every = max(1, int(self.config.record_every))
+        return max(1.0, float(self.config.fps) / every)
+
+    def _writer_for(self, name: str, frame_bgr: np.ndarray, *, is_dashboard: bool = False) -> cv2.VideoWriter:
+        if self.session_dir is None:
+            self.start()
+        assert self.session_dir is not None
+        assert self.views_dir is not None
+
+        key = "dashboard" if is_dashboard else f"view_{sanitise_filename(name)}"
+        if key in self._writers:
+            return self._writers[key]
+
+        h, w = frame_bgr.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*self.config.record_codec[:4])
+        filename = "dashboard.mp4" if is_dashboard else f"{sanitise_filename(name)}.mp4"
+        output_path = (self.session_dir if is_dashboard else self.views_dir) / filename
+        writer = cv2.VideoWriter(str(output_path), fourcc, self._video_fps(), (w, h))
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not open video writer for {output_path}")
+        self._writers[key] = writer
+        return writer
+
+    def _write_video(self, name: str, frame_bgr: np.ndarray, *, is_dashboard: bool = False) -> None:
+        writer = self._writer_for(name, frame_bgr, is_dashboard=is_dashboard)
+        writer.write(ensure_bgr(frame_bgr))
+
+    def _write_raw_npz(self, packet: KeyframePacket, right_frame: Optional[np.ndarray]) -> None:
+        if not self.config.record_raw_npz:
+            return
+        if self.raw_dir is None:
+            return
+        filename = self.raw_dir / f"frame_{packet.frame_index:06d}.npz"
+        arrays = {
+            "left_raw": packet.left_raw,
+            "left_norm": packet.left_norm,
+            "left_gray": packet.left_gray,
+            "depth_raw_mm": packet.depth_raw,
+            "depth_gray": packet.depth_gray,
+            "depth_valid_mask": packet.depth_valid_mask,
+            "near_mask": packet.near_mask,
+        }
+        if right_frame is not None:
+            arrays["right_raw"] = right_frame
+        np.savez_compressed(filename, **arrays)
+
+    def record(
+        self,
+        *,
+        packet: KeyframePacket,
+        right_frame: Optional[np.ndarray],
+        views: List[Tuple[str, np.ndarray, Optional[bool]]],
+        dashboard: np.ndarray,
+    ) -> None:
+        if not self.active:
+            return
+        every = max(1, int(self.config.record_every))
+        if packet.frame_index % every != 0:
+            return
+
+        if self.config.record_dashboard:
+            self._write_video("dashboard", dashboard, is_dashboard=True)
+
+        if self.config.record_views:
+            for label, image, ok in views:
+                cell = render_view_cell(label, image, ok, self.config.grid_cell_size)
+                self._write_video(label, cell, is_dashboard=False)
+                self._seen_view_names.add(label)
+
+        self._write_raw_npz(packet, right_frame)
+
+        if self._metadata_file is not None:
+            row = {
+                "timestamp": packet.timestamp,
+                "frame_index": packet.frame_index,
+                "keyframe": packet.keyframe,
+                "stable": packet.stable,
+                "occluded": packet.occluded,
+                "stable_count": packet.stable_count,
+                "motion_score": packet.motion_score,
+                "rgb_motion_score": packet.rgb_motion_score,
+                "depth_motion_score": packet.depth_motion_score,
+                "novelty_score": packet.novelty_score,
+                "near_ratio": packet.near_ratio,
+                "invalid_ratio": packet.invalid_ratio,
+                "view_labels": [label for label, _, _ in views],
+            }
+            self._metadata_file.write(json.dumps(row) + "\n")
+            self._metadata_file.flush()
+
+        self._saved_frame_count += 1
+
+    def save_snapshot(
+        self,
+        *,
+        packet: KeyframePacket,
+        right_frame: Optional[np.ndarray],
+        views: List[Tuple[str, np.ndarray, Optional[bool]]],
+        dashboard: np.ndarray,
+    ) -> Path:
+        if self.session_dir is None:
+            self.start()
+        assert self.session_dir is not None
+        snapshot_dir = self.session_dir / "snapshots" / f"frame_{packet.frame_index:06d}"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        cv2.imwrite(str(snapshot_dir / "dashboard.png"), dashboard)
+        for label, image, ok in views:
+            cell = render_view_cell(label, image, ok, self.config.grid_cell_size)
+            cv2.imwrite(str(snapshot_dir / f"{sanitise_filename(label)}.png"), cell)
+
+        np.savez_compressed(
+            snapshot_dir / "raw_packet.npz",
+            left_raw=packet.left_raw,
+            left_norm=packet.left_norm,
+            left_gray=packet.left_gray,
+            depth_raw_mm=packet.depth_raw,
+            depth_gray=packet.depth_gray,
+            depth_valid_mask=packet.depth_valid_mask,
+            near_mask=packet.near_mask,
+            right_raw=right_frame if right_frame is not None else np.array([], dtype=np.uint8),
+        )
+        print(f"Snapshot saved: {snapshot_dir}")
+        return snapshot_dir
+
+
 class LiveStreamViewer:
     """
     Live diagnostic viewer for OAK-D SR streams and pre-CNN processing stages.
@@ -618,15 +671,6 @@ class LiveStreamViewer:
         self._last_right_frame: Optional[np.ndarray] = None
         self._preprocessing_enabled = self.config.enable_preprocessing and self.config.mode in {"preprocess", "all"}
         self._preprocessor: Optional[PreprocessingPreview] = None
-        self._baseline = EmptyBoardBaseline(
-            frames_required=self.config.auto_baseline_frames,
-            min_valid_ratio=self.config.baseline_min_valid_ratio,
-            min_piece_height_mm=self.config.min_piece_height_mm,
-            max_piece_height_mm=self.config.max_piece_height_mm,
-            min_piece_area_px=self.config.min_piece_area_px,
-            height_max_mm=self.config.height_max_mm,
-        )
-        self._recorder = DiagnosticRecorder(self.config)
 
         if self._preprocessing_enabled:
             try:
@@ -634,6 +678,15 @@ class LiveStreamViewer:
             except Exception as exc:
                 print(f"Preprocessing preview disabled: {exc}")
                 self._preprocessing_enabled = False
+
+        self._baseline = DepthBaselineModel(
+            frames_required=self.config.auto_baseline_frames,
+            min_valid_ratio=self.config.baseline_min_valid_ratio,
+            height_max_mm=self.config.height_max_mm,
+            min_piece_height_mm=self.config.min_piece_height_mm,
+            max_piece_height_mm=self.config.max_piece_height_mm,
+            min_piece_area_px=self.config.min_piece_area_px,
+        )
 
     def _make_gate(self) -> OakSRKeyframeGate:
         # Create exactly one DepthAI stream/pipeline. The earlier implementation
@@ -654,6 +707,9 @@ class LiveStreamViewer:
         mode = self.config.mode
         views: List[Tuple[str, np.ndarray, Optional[bool]]] = []
 
+        self._baseline.update(packet.depth_raw, allow_auto_capture=self.config.auto_baseline)
+        height_mm, height_uint8, baseline_piece_mask, overlap_mask = self._baseline.compute(packet.depth_raw)
+
         if mode in {"streams", "gate", "preprocess", "all"}:
             views.append(("left RGB raw", packet.left_raw, None))
             if right_frame is not None:
@@ -668,11 +724,11 @@ class LiveStreamViewer:
                     ("gate depth BW", packet.depth_gray, None),
                     ("valid depth mask", packet.depth_valid_mask * 255, packet.invalid_ratio <= self.config.max_invalid_ratio),
                     ("near/hand occlusion mask", packet.near_mask * 255, not packet.occluded),
+                    ("baseline valid-overlap mask", overlap_mask, self._baseline.ready),
+                    ("baseline height above board", height_uint8, self._baseline.ready),
+                    ("baseline pre-CNN piece mask", baseline_piece_mask, self._baseline.ready),
                 ]
             )
-            if self.config.auto_baseline:
-                self._baseline.add_empty_frame(packet.depth_raw)
-                views.extend(self._baseline.build_views(packet.depth_raw))
 
         if mode in {"preprocess", "all"} and self._preprocessing_enabled and self._preprocessor is not None:
             views.extend(self._preprocessor.build_views(packet))
@@ -681,6 +737,10 @@ class LiveStreamViewer:
 
     def run(self) -> None:
         gate = self._make_gate().start()
+        recorder = DiagnosticRecorder(self.config)
+        if self.config.record:
+            recorder.start()
+
         cv2.namedWindow(self.config.window_name, cv2.WINDOW_NORMAL)
 
         try:
@@ -698,12 +758,15 @@ class LiveStreamViewer:
                 views = self._build_views(packet, right_frame)
                 grid = make_grid(views, cell_size=self.config.grid_cell_size, columns=self.config.grid_columns)
 
+                if recorder.active:
+                    rec_text = f"REC frames={recorder.saved_frame_count} dir={recorder.session_dir.name if recorder.session_dir else ''}"
+                    cv2.putText(grid, rec_text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 255), 2, cv2.LINE_AA)
+
                 if self.config.show_help:
-                    rec_state = "REC" if self._recorder.active else "not rec"
-                    help_text = "q/ESC quit | p preprocess | r record | s snapshot | b recapture baseline | c clear baseline | " + rec_state
+                    help_text = "q/ESC quit | r record | s snapshot | b recapture baseline | c clear baseline | p preprocessing | mode=" + self.config.mode
                     cv2.putText(grid, help_text, (10, grid.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-                self._recorder.record_frame(packet=packet, views=views, dashboard=grid, right_frame=right_frame)
+                recorder.record(packet=packet, right_frame=right_frame, views=views, dashboard=grid)
 
                 cv2.imshow(self.config.window_name, grid)
                 key = cv2.waitKey(1) & 0xFF
@@ -714,19 +777,18 @@ class LiveStreamViewer:
                     self._preprocessing_enabled = not self._preprocessing_enabled
                     print(f"Preprocessing preview: {self._preprocessing_enabled}")
                 if key == ord("r"):
-                    self._recorder.toggle()
+                    recorder.toggle()
                 if key == ord("s"):
-                    self._recorder.save_snapshot(packet=packet, views=views, dashboard=grid, right_frame=right_frame)
+                    recorder.save_snapshot(packet=packet, right_frame=right_frame, views=views, dashboard=grid)
                 if key == ord("b"):
-                    self._baseline.reset()
-                    print("Baseline reset. Leave board empty while baseline is recaptured.")
+                    self._baseline.request_capture()
+                    print("Baseline recapture requested. Clear the board and hold it still.")
                 if key == ord("c"):
-                    self._baseline.reset()
-                    self.config.auto_baseline = False
-                    print("Baseline cleared and auto-baseline disabled for this run.")
+                    self._baseline.clear()
+                    print("Baseline cleared.")
 
         finally:
-            self._recorder.stop()
+            recorder.stop()
             gate.stop()
             cv2.destroyAllWindows()
 
@@ -782,7 +844,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         baseline_min_valid_ratio=args.baseline_min_valid_ratio,
         record=args.record,
         record_dir=args.record_dir,
-        record_every=args.record_every,
+        record_every=max(1, args.record_every),
         record_dashboard=not args.no_record_dashboard,
         record_views=not args.no_record_views,
         record_raw_npz=args.record_raw_npz,

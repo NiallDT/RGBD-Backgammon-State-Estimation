@@ -70,6 +70,14 @@ class PieceDetectionResult:
     region_counts: Dict[RegionName, Dict[ColourName, int]]
     overlay_bgr: np.ndarray
     confidence: float
+    # Optional diagnostic masks. These are useful for tuning the detector and for
+    # showing where RGB/height evidence came from, but the rest of the pipeline
+    # can ignore them.
+    stable_depth_support_mask: Optional[np.ndarray] = None
+    slot_candidate_mask: Optional[np.ndarray] = None
+    checker_detection_area_mask: Optional[np.ndarray] = None
+    stack_class_bgr: Optional[np.ndarray] = None
+    debug: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -122,6 +130,15 @@ class TemporalEstimate:
 
 
 @dataclass
+class StateEvent:
+    event_type: str
+    description: str
+    timestamp: Optional[float] = None
+    confidence: float = 0.0
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class PipelineResult:
     board_lock: BoardLock
     rectified: Optional[RectifiedBoard]
@@ -134,7 +151,27 @@ class PipelineResult:
     committed: bool
     state_changed: bool
     debug: Dict[str, Any] = field(default_factory=dict)
+    events: List[StateEvent] = field(default_factory=list)
 
 
 def make_empty_region_counts(region_names: List[RegionName]) -> Dict[RegionName, Dict[ColourName, int]]:
     return {name: {"light": 0, "dark": 0} for name in region_names}
+
+
+__all__ = [
+    "BoardLock",
+    "RectifiedBoard",
+    "NormalisedBoard",
+    "RegionMasks",
+    "PieceInstance",
+    "PieceDetectionResult",
+    "DiceObservation",
+    "CubeObservation",
+    "DiceCubeObservation",
+    "BoardState",
+    "ValidationReport",
+    "TemporalEstimate",
+    "StateEvent",
+    "PipelineResult",
+    "make_empty_region_counts",
+]
