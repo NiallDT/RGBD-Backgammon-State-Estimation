@@ -27,7 +27,7 @@ class BoardStateEventInferer:
       - dice_changed
       - cube_changed
 
-    A later dissertation extension can replace or extend this with a legal
+    This can be extended later with a legal
     move/cube-action inference engine.
     """
 

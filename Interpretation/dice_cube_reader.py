@@ -30,8 +30,7 @@ class DiceCubeReader:
     Classical dice / doubling-cube observation step.
 
     Dice and cube searches can be restricted to RegionMasks['dice_area'] and
-    RegionMasks['cube_area'] when those masks are available. This avoids the
-    checker detector and dice/cube reader fighting over the same visual objects.
+    RegionMasks['cube_area'] when those masks are available. This keeps checker detection and dice/cube reading from using the same pixels.
     """
 
     def __init__(self, config: Optional[DiceCubeConfig] = None) -> None:

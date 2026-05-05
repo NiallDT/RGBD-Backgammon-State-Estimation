@@ -80,7 +80,7 @@ class OakSRKeyframeGate:
         depth_pad: Tuple[int, int] = (40, 0),
         streams: Optional[OakSRStreams] = None,
     ) -> None:
-        # IMPORTANT: accept an externally-created stream object so callers such
+        # Accept an externally-created stream object so callers such
         # as live_stream_viewer.py do not accidentally construct two DepthAI
         # pipelines before starting one. The earlier version did that, which
         # could leave the OAK-D SR in a failed boot state.

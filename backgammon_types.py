@@ -70,9 +70,8 @@ class PieceDetectionResult:
     region_counts: Dict[RegionName, Dict[ColourName, int]]
     overlay_bgr: np.ndarray
     confidence: float
-    # Optional diagnostic masks. These are useful for tuning the detector and for
-    # showing where RGB/height evidence came from, but the rest of the pipeline
-    # can ignore them.
+    # Diagnostic masks used while tuning the detector. The main pipeline can
+    # ignore these once the counts and overlay have been produced.
     stable_depth_support_mask: Optional[np.ndarray] = None
     slot_candidate_mask: Optional[np.ndarray] = None
     checker_detection_area_mask: Optional[np.ndarray] = None

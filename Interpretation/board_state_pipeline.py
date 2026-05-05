@@ -23,7 +23,7 @@ class PipelineConfig:
 
 class BoardStatePipeline:
     """
-    End-to-end orchestration for the dissertation pipeline.
+    Runs the board-state pipeline from frame/keyframe input through to a pipeline result.
 
     The caller should pass either a raw RGB-D frame or an accepted KeyframePacket.
     This class returns a PipelineResult containing both intermediate artifacts and

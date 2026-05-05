@@ -72,8 +72,8 @@ class RGBDPieceDetector:
     a temporally stable height-above-board support mask, and classifies each
     occupied slot as either a 1-high chip or a 2-high stack.
 
-    This remains a classical baseline and a clean interface for replacing the
-    slot decision with a CNN later.
+    This remains a classical baseline. The slot decision could be swapped for
+    a learned classifier later if the dataset supports it.
     """
 
     def __init__(self, config: Optional[PieceDetectionConfig] = None) -> None:

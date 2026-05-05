@@ -113,9 +113,9 @@ class BoardRegistrar:
     """
     Initial board-registration / recovery stage.
 
-    This is a classical implementation intended to get you to the point where
-    you can lock the board and start collecting aligned training data. Later,
-    the same interface can be backed by a dedicated corner-regression CNN.
+    Classical board-localisation stage used to get a stable board lock before
+    collecting aligned RGB-D data. The same interface could later be backed
+    by a dedicated corner-regression model if needed.
     """
 
     def __init__(self, config: Optional[BoardRegistrationConfig] = None) -> None:
